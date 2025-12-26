@@ -1,0 +1,14 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio user-specific files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Publish artifacts
+publish/
+publish.zip

@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net6.0-windows7.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <StartupObject>LocalPrintAgent.Program</StartupObject>
+  </PropertyGroup>
+
+  <PropertyGroup>
+	<RuntimeIdentifier>win-x64</RuntimeIdentifier>
+	<PublishSingleFile>true</PublishSingleFile>
+	<SelfContained>true</SelfContained>
+	<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+	<SupportedOSPlatformVersion>7.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="PdfiumViewer" Version="2.13.0" />
+    <PackageReference Include="PdfiumViewer.Native.x86_64.v8-xfa" Version="2018.4.8.256" />
+  </ItemGroup>
+
+  <Target Name="CopyPdfiumNativeToPublish" AfterTargets="Publish" Condition="Exists('$(TargetDir)x64\\pdfium.dll')">
+    <MakeDir Directories="$(PublishDir)x64" />
+    <Copy SourceFiles="$(TargetDir)x64\\pdfium.dll" DestinationFolder="$(PublishDir)x64" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>
