@@ -232,15 +232,18 @@ namespace LocalPrintAgent
             if (paperSize == null)
                 throw new Exception(req.pageSizeId == 1 ? "printer does not support A3" : "printer does not support A4");
 
+            var landscapeSetting = ResolveLandscapeSetting(req, paperSize);
             printDoc.PrinterSettings = printerSettings;
             printDoc.DefaultPageSettings.PaperSize = paperSize;
-            printDoc.DefaultPageSettings.Landscape = !req.isPageOrientationPortrait;
+            printDoc.DefaultPageSettings.Landscape = landscapeSetting;
             printDoc.PrintController = new StandardPrintController();
 
             _logger(
                 $"Print job: jobId={req.jobId}, printer={printerName}, " +
                 $"isPdf={ShouldUsePdf(req)}, bytes={pdfBytes.Length}, " +
                 $"pageSizeId={req.pageSizeId}, portrait={req.isPageOrientationPortrait}, " +
+                $"paperSize={DescribePaperSize(paperSize)}, paperIsLandscape={IsLandscapePaper(paperSize)}, " +
+                $"landscapeSetting={landscapeSetting}, finalPortrait={ResolveFinalIsPortrait(landscapeSetting, paperSize)}, " +
                 $"duplexSingleSided={req.isDuplexSingleSided}, range={req.printPageRange ?? ""}"
             );
 
@@ -292,6 +295,23 @@ namespace LocalPrintAgent
 
             return null;
         }
+
+        private static bool IsLandscapePaper(PaperSize size) => size.Width > size.Height;
+
+        private static bool ResolveLandscapeSetting(PrintRequest req, PaperSize paperSize)
+        {
+            var paperIsLandscape = IsLandscapePaper(paperSize);
+            return paperIsLandscape ? req.isPageOrientationPortrait : !req.isPageOrientationPortrait;
+        }
+
+        private static bool ResolveFinalIsPortrait(bool landscapeSetting, PaperSize paperSize)
+        {
+            var paperIsLandscape = IsLandscapePaper(paperSize);
+            return paperIsLandscape ? landscapeSetting : !landscapeSetting;
+        }
+
+        private static string DescribePaperSize(PaperSize size) =>
+            $"{size.PaperName}({size.Kind}, {size.Width}x{size.Height})";
 
         private static bool TryParsePageRange(string? value, out int from, out int to)
         {
