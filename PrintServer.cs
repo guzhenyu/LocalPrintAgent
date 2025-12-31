@@ -1,6 +1,7 @@
 using PdfiumViewer;
 using System;
 using System.Diagnostics;
+using System.Drawing;
 using System.Drawing.Printing;
 using System.IO;
 using System.Net;
@@ -225,7 +226,6 @@ namespace LocalPrintAgent
         {
             using var ms = new MemoryStream(pdfBytes);
             using var pdf = PdfDocument.Load(ms);
-            using var printDoc = pdf.CreatePrintDocument();
 
             var printerSettings = BuildPrinterSettings(req, printerName);
             var paperSize = FindPaperSize(printerSettings, req.pageSizeId);
@@ -233,17 +233,75 @@ namespace LocalPrintAgent
                 throw new Exception(req.pageSizeId == 1 ? "printer does not support A3" : "printer does not support A4");
 
             var landscapeSetting = ResolveLandscapeSetting(req, paperSize);
+            var pageCount = pdf.PageCount;
+            var fromPage = printerSettings.FromPage > 0 ? printerSettings.FromPage - 1 : 0;
+            var toPage = printerSettings.ToPage > 0 ? Math.Min(printerSettings.ToPage, pageCount) : pageCount;
+            if (fromPage < 0) fromPage = 0;
+            if (fromPage >= pageCount) fromPage = 0;
+            if (toPage < fromPage) toPage = pageCount;
+
+            var firstPageSize = pageCount > 0 ? pdf.PageSizes[0] : SizeF.Empty;
+            var pdfIsLandscape = pageCount > 0 && IsLandscapePdfPage(firstPageSize);
+
+            using var printDoc = new PrintDocument();
             printDoc.PrinterSettings = printerSettings;
             printDoc.DefaultPageSettings.PaperSize = paperSize;
             printDoc.DefaultPageSettings.Landscape = landscapeSetting;
             printDoc.PrintController = new StandardPrintController();
+
+            printDoc.QueryPageSettings += (_, e) =>
+            {
+                e.PageSettings.PaperSize = paperSize;
+                e.PageSettings.Landscape = landscapeSetting;
+            };
+
+            var currentPage = fromPage;
+            var loggedPrintBounds = false;
+            printDoc.PrintPage += (_, e) =>
+            {
+                if (currentPage >= toPage || currentPage >= pageCount)
+                {
+                    e.HasMorePages = false;
+                    return;
+                }
+
+                var pageSize = pdf.PageSizes[currentPage];
+                var pageIsLandscape = IsLandscapePdfPage(pageSize);
+                var boundsIsLandscape = e.PageBounds.Width > e.PageBounds.Height;
+
+                if (!loggedPrintBounds)
+                {
+                    _logger(
+                        "Print page debug: " +
+                        $"page={currentPage + 1}, pdfPage={DescribePdfPage(pageSize)}, pdfIsLandscape={pageIsLandscape}, " +
+                        $"bounds={e.PageBounds.Width}x{e.PageBounds.Height}, boundsIsLandscape={boundsIsLandscape}, " +
+                        $"hardMargin={e.PageSettings.HardMarginX}x{e.PageSettings.HardMarginY}"
+                    );
+                    loggedPrintBounds = true;
+                }
+
+                double left = -e.PageSettings.HardMarginX;
+                double top = -e.PageSettings.HardMarginY;
+                double width = e.PageBounds.Width;
+                double height = e.PageBounds.Height;
+
+                if (pageIsLandscape != boundsIsLandscape)
+                {
+                    Swap(ref height, ref width);
+                    Swap(ref left, ref top);
+                }
+
+                RenderPage(pdf, currentPage, e, left, top, width, height);
+                currentPage++;
+                e.HasMorePages = currentPage < toPage;
+            };
 
             _logger(
                 $"Print job: jobId={req.jobId}, printer={printerName}, " +
                 $"isPdf={ShouldUsePdf(req)}, bytes={pdfBytes.Length}, " +
                 $"pageSizeId={req.pageSizeId}, portrait={req.isPageOrientationPortrait}, " +
                 $"paperSize={DescribePaperSize(paperSize)}, paperIsLandscape={IsLandscapePaper(paperSize)}, " +
-                $"landscapeSetting={landscapeSetting}, finalPortrait={ResolveFinalIsPortrait(landscapeSetting, paperSize)}, " +
+                $"landscapeSetting={landscapeSetting}, pdfPage={DescribePdfPage(firstPageSize)}, pdfIsLandscape={pdfIsLandscape}, " +
                 $"duplexSingleSided={req.isDuplexSingleSided}, range={req.printPageRange ?? ""}"
             );
 
@@ -298,20 +356,64 @@ namespace LocalPrintAgent
 
         private static bool IsLandscapePaper(PaperSize size) => size.Width > size.Height;
 
+        private static bool IsLandscapePdfPage(SizeF size) => size.Width > size.Height;
+
         private static bool ResolveLandscapeSetting(PrintRequest req, PaperSize paperSize)
         {
             var paperIsLandscape = IsLandscapePaper(paperSize);
             return paperIsLandscape ? req.isPageOrientationPortrait : !req.isPageOrientationPortrait;
         }
 
-        private static bool ResolveFinalIsPortrait(bool landscapeSetting, PaperSize paperSize)
-        {
-            var paperIsLandscape = IsLandscapePaper(paperSize);
-            return paperIsLandscape ? landscapeSetting : !landscapeSetting;
-        }
-
         private static string DescribePaperSize(PaperSize size) =>
             $"{size.PaperName}({size.Kind}, {size.Width}x{size.Height})";
+
+        private static string DescribePdfPage(SizeF size) =>
+            $"{size.Width:0.##}x{size.Height:0.##}";
+
+        private static void RenderPage(PdfDocument pdf, int page, PrintPageEventArgs e, double left, double top, double width, double height)
+        {
+            var size = pdf.PageSizes[page];
+
+            double pageScale = size.Height / size.Width;
+            double printScale = height / width;
+
+            double scaledWidth = width;
+            double scaledHeight = height;
+
+            if (pageScale > printScale)
+                scaledWidth = width * (printScale / pageScale);
+            else
+                scaledHeight = height * (pageScale / printScale);
+
+            left += (width - scaledWidth) / 2;
+            top += (height - scaledHeight) / 2;
+
+            pdf.Render(
+                page,
+                e.Graphics,
+                e.Graphics.DpiX,
+                e.Graphics.DpiY,
+                new Rectangle(
+                    AdjustDpi(e.Graphics.DpiX, left),
+                    AdjustDpi(e.Graphics.DpiY, top),
+                    AdjustDpi(e.Graphics.DpiX, scaledWidth),
+                    AdjustDpi(e.Graphics.DpiY, scaledHeight)
+                ),
+                PdfRenderFlags.ForPrinting | PdfRenderFlags.Annotations
+            );
+        }
+
+        private static int AdjustDpi(double dpi, double value)
+        {
+            return (int)((value / 100.0) * dpi);
+        }
+
+        private static void Swap(ref double a, ref double b)
+        {
+            var tmp = a;
+            a = b;
+            b = tmp;
+        }
 
         private static bool TryParsePageRange(string? value, out int from, out int to)
         {
