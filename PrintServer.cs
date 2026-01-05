@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Printing;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -34,6 +35,7 @@ namespace LocalPrintAgent
         {
             _listener.Start();
             _logger($"HTTP listening on: {string.Join(", ", _listener.Prefixes)}");
+            LogEnvironmentInfo();
             _ = LoopAsync(_cts.Token);
         }
 
@@ -130,6 +132,7 @@ namespace LocalPrintAgent
         private async Task HandlePrintAsync(HttpListenerContext ctx)
         {
             var req = await ReadJsonAsync<PrintRequest>(ctx.Request);
+            _logger($"[dbg-v1.0] Incoming print request: pageSizeId={req.pageSizeId}, portrait={req.isPageOrientationPortrait}, isPdf={req.isPdf}, pdfUrl={(string.IsNullOrWhiteSpace(req.pdfUrl) ? "" : req.pdfUrl)}, pdfBase64={(string.IsNullOrWhiteSpace(req.pdfBase64) ? "" : "<inline>")}, htmlBase64={(string.IsNullOrWhiteSpace(req.htmlBase64) ? "" : $"len={req.htmlBase64?.Length}")}, range={req.printPageRange}");
             ValidateRequest(req);
 
             var printerName = ResolvePrinterName(req);
@@ -243,6 +246,8 @@ namespace LocalPrintAgent
             var firstPageSize = pageCount > 0 ? pdf.PageSizes[0] : SizeF.Empty;
             var pdfIsLandscape = pageCount > 0 && IsLandscapePdfPage(firstPageSize);
 
+            LogPrinterDebug(printerSettings, paperSize);
+
             using var printDoc = new PrintDocument();
             printDoc.PrinterSettings = printerSettings;
             printDoc.DefaultPageSettings.PaperSize = paperSize;
@@ -253,6 +258,9 @@ namespace LocalPrintAgent
             {
                 e.PageSettings.PaperSize = paperSize;
                 e.PageSettings.Landscape = landscapeSetting;
+                _logger(
+                    $"[dbg-v1.0] QueryPageSettings: landscape={e.PageSettings.Landscape}, bounds={e.PageSettings.Bounds.Width}x{e.PageSettings.Bounds.Height}, hardMargin={e.PageSettings.HardMarginX}x{e.PageSettings.HardMarginY}, printerLandscapeAngle={printerSettings.LandscapeAngle}"
+                );
             };
 
             var currentPage = fromPage;
@@ -275,7 +283,8 @@ namespace LocalPrintAgent
                         "Print page debug: " +
                         $"page={currentPage + 1}, pdfPage={DescribePdfPage(pageSize)}, pdfIsLandscape={pageIsLandscape}, " +
                         $"bounds={e.PageBounds.Width}x{e.PageBounds.Height}, boundsIsLandscape={boundsIsLandscape}, " +
-                        $"hardMargin={e.PageSettings.HardMarginX}x{e.PageSettings.HardMarginY}"
+                        $"hardMargin={e.PageSettings.HardMarginX}x{e.PageSettings.HardMarginY}, " +
+                        $"pageLandscapeSetting={e.PageSettings.Landscape}"
                     );
                     loggedPrintBounds = true;
                 }
@@ -370,6 +379,50 @@ namespace LocalPrintAgent
         private static string DescribePdfPage(SizeF size) =>
             $"{size.Width:0.##}x{size.Height:0.##}";
 
+        private void LogEnvironmentInfo()
+        {
+            try
+            {
+                var os = Environment.OSVersion;
+                var framework = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription;
+                var proc = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture;
+                var osArch = System.Runtime.InteropServices.RuntimeInformation.OSArchitecture;
+                _logger($"[dbg-v1.0] Host info: OS={os}, OSArch={osArch}, ProcArch={proc}, Framework={framework}, Machine={Environment.MachineName}, User={Environment.UserName}");
+            }
+            catch (Exception ex)
+            {
+                _logger($"[dbg-v1.0] Host info failed: {ex}");
+            }
+        }
+
+        private void LogPrinterDebug(PrinterSettings settings, PaperSize selectedPaper)
+        {
+            try
+            {
+                var papers = DescribePaperSizes(settings);
+                _logger($"[dbg-v1.0] Printer info: name={settings.PrinterName}, isValid={settings.IsValid}, isDefault={settings.IsDefaultPrinter}, canDuplex={settings.CanDuplex}, landscapeAngle={settings.LandscapeAngle}, paperCount={settings.PaperSizes.Count}, selectedPaper={DescribePaperSize(selectedPaper)}, papers={papers}");
+            }
+            catch (Exception ex)
+            {
+                _logger($"[dbg-v1.0] Printer info failed: {ex}");
+            }
+        }
+
+        private static string DescribePaperSizes(PrinterSettings settings)
+        {
+            try
+            {
+                var items = settings.PaperSizes.Cast<PaperSize>()
+                    .Select(p => $"{p.Kind}/{p.PaperName}:{p.Width}x{p.Height}")
+                    .Take(50);
+                return string.Join("; ", items);
+            }
+            catch
+            {
+                return "unavailable";
+            }
+        }
+
         private static void RenderPage(PdfDocument pdf, int page, PrintPageEventArgs e, double left, double top, double width, double height)
         {
             var size = pdf.PageSizes[page];
@@ -388,16 +441,17 @@ namespace LocalPrintAgent
             left += (width - scaledWidth) / 2;
             top += (height - scaledHeight) / 2;
 
+            var gfx = e.Graphics ?? throw new InvalidOperationException("PrintPage graphics is null");
             pdf.Render(
                 page,
-                e.Graphics,
-                e.Graphics.DpiX,
-                e.Graphics.DpiY,
+                gfx,
+                gfx.DpiX,
+                gfx.DpiY,
                 new Rectangle(
-                    AdjustDpi(e.Graphics.DpiX, left),
-                    AdjustDpi(e.Graphics.DpiY, top),
-                    AdjustDpi(e.Graphics.DpiX, scaledWidth),
-                    AdjustDpi(e.Graphics.DpiY, scaledHeight)
+                    AdjustDpi(gfx.DpiX, left),
+                    AdjustDpi(gfx.DpiY, top),
+                    AdjustDpi(gfx.DpiX, scaledWidth),
+                    AdjustDpi(gfx.DpiY, scaledHeight)
                 ),
                 PdfRenderFlags.ForPrinting | PdfRenderFlags.Annotations
             );
@@ -457,7 +511,7 @@ namespace LocalPrintAgent
                 throw new Exception("htmlBase64 required");
 
             var html = BuildHtmlDocument(rawHtml, req.pageSizeId, req.isPageOrientationPortrait);
-            var tmpDir = Path.Combine(Path.GetTempPath(), "LocalPrintAgent");
+            var tmpDir = GetWorkTempDir();
             Directory.CreateDirectory(tmpDir);
 
             var htmlPath = Path.Combine(tmpDir, $"print_{Guid.NewGuid():N}.html");
@@ -471,12 +525,15 @@ namespace LocalPrintAgent
                 if (string.IsNullOrWhiteSpace(edgePath))
                     throw new Exception("msedge not found for html printing");
 
+                var args =
+                    "--headless --disable-gpu --no-first-run --no-default-browser-check --print-to-pdf-no-header " +
+                    $"--print-to-pdf={Quote(pdfPath)} {Quote(new Uri(htmlPath).AbsoluteUri)}";
+                _logger($"[dbg-v1.0] HtmlToPdf start: edgePath={edgePath}, args={args}, htmlLen={html.Length}, pageSizeId={req.pageSizeId}, portrait={req.isPageOrientationPortrait}");
+
                 var psi = new ProcessStartInfo
                 {
                     FileName = edgePath,
-                    Arguments =
-                        "--headless --disable-gpu --no-first-run --no-default-browser-check --print-to-pdf-no-header " +
-                        $"--print-to-pdf={Quote(pdfPath)} {Quote(new Uri(htmlPath).AbsoluteUri)}",
+                    Arguments = args,
                     CreateNoWindow = true,
                     UseShellExecute = false,
                     RedirectStandardOutput = false,
@@ -509,17 +566,29 @@ namespace LocalPrintAgent
 
                 await waitTask;
                 var stderr = (await stderrTask).Trim();
+                _logger($"[dbg-v1.0] HtmlToPdf done: exitCode={proc.ExitCode}, stderr={(string.IsNullOrWhiteSpace(stderr) ? "<empty>" : stderr)}");
                 if (!File.Exists(pdfPath))
                 {
-                    throw new Exception(string.IsNullOrWhiteSpace(stderr) ? "html to pdf failed" : stderr);
+                    try
+                    {
+                        var pdfCandidates = Directory.GetFiles(tmpDir, "print_*.pdf")
+                            .Select(f => $"{f} (len={new FileInfo(f).Length})")
+                            .ToArray();
+                        var htmlCandidates = Directory.GetFiles(tmpDir, "print_*.html")
+                            .Select(f => $"{f} (len={new FileInfo(f).Length})")
+                            .ToArray();
+                        _logger($"[dbg-v1.0] HtmlToPdf missing pdf: expected={pdfPath}, pdfCandidates=[{string.Join("; ", pdfCandidates)}], htmlCandidates=[{string.Join("; ", htmlCandidates)}]");
+                    }
+                    catch { /* ignore */ }
+
+                    throw new Exception(string.IsNullOrWhiteSpace(stderr) ? "html to pdf failed" : $"html to pdf failed: {stderr}");
                 }
 
                 return await File.ReadAllBytesAsync(pdfPath);
             }
             finally
             {
-                TryDelete(htmlPath);
-                TryDelete(pdfPath);
+                // 调试阶段：保留生成的 html/pdf 文件
             }
         }
 
@@ -601,6 +670,23 @@ namespace LocalPrintAgent
             }
 
             return null;
+        }
+
+        private static string GetWorkTempDir()
+        {
+            try
+            {
+                var baseDir = AppContext.BaseDirectory;
+                if (string.IsNullOrWhiteSpace(baseDir))
+                {
+                    baseDir = Directory.GetCurrentDirectory();
+                }
+                return Path.Combine(baseDir, "temp");
+            }
+            catch
+            {
+                return Path.Combine(Path.GetTempPath(), "LocalPrintAgent");
+            }
         }
 
         private static string Quote(string value) => "\"" + value + "\"";
